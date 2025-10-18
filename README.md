@@ -9,6 +9,11 @@ usage: vimundo-file-reconstructor [-h] [-o FILE] [-v] [-a]
                                   [undo_file]
 ```
 
+<div align="center">
+  <em>Claude "excited" after it saw my successful run...</em><br>
+  <img src="ss/claude-celebration.png" alt="Claude.ai 'excited'"><br>
+</div>
+
 ### Why!?
 
 If you're here, you probably know why, and I'm sorry for your loss.
@@ -18,8 +23,12 @@ in my git repositories. HOWEVER, I have `undodir` set for persistent undo files.
 
 In the past I would `strings myundofile` and reconstruct the file by hand from
 the contents, but by parsing vimundo files we have the benefit of the line
-numbers and whatnot, and thus began working with **claude.ai** for many hours over
-a couple days. I provided Claude vim's `undo.c` and we got to work.
+numbers, timestamps, etc. I've needed such a utility, off and on, for years, but
+now I can just provide an LLM Vim's `undo.c`, and it'll figure out the structures,
+and with a bit of my own guidance and wisdom, and several hours working with
+**claude.ai** over a couple days, I was able to recover most of my lost contents.
+
+*Claude and I are apparently happy to present to you `vimundo-file-reconstructor`*
 
 *(Note: You might have 'undodir' set in your .vimrc, in which case vim stores
 files there, using full paths with slashes replaced by % characters.
