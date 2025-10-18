@@ -10,8 +10,8 @@ usage: vimundo-file-reconstructor [-h] [-o FILE] [-v] [-a]
 ```
 
 <div align="center">
-  <em>Claude "excited" after it saw my successful run...</em><br>
   <img src="ss/claude-celebration.png" alt="Claude.ai 'excited'"><br>
+  <em>Claude "excited" after it saw my successful run...</em><br>
 </div>
 
 ### Why!?
