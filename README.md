@@ -4,9 +4,8 @@ Vim Undo File Parser - Recover files from .un~ files.
 
 ```
 usage: vimundo-file-reconstructor [-h] [-o FILE] [-v] [-a]
-                                  [--hex-dump OFFSET LENGTH] [-X N] [-D]
-                                  [--forensic] [--explain]
-                                  [undo_file]
+        [--hex-dump OFFSET LENGTH] [-X N] [-D]
+        [--forensic] [--explain] [undo_file]
 ```
 
 <div align="center">
