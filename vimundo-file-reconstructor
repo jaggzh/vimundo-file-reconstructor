@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""
+Vim Undo File Parser - Recover files from .un~ files
+Parses Vim's persistent undo file format to extract text history.
+
+Based on Vim's undo.c format specification.
+"""
+
+import struct
+import sys
+import argparse
+from pathlib import Path
+from typing import BinaryIO, Optional, List, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+
+# Magic numbers from undo.c
+UF_START_MAGIC = b"Vim\x9fUnDo\xe5"
+UF_START_MAGIC_LEN = 9
+UF_HEADER_MAGIC = 0x5fd0
+UF_HEADER_END_MAGIC = 0xe7aa
+UF_ENTRY_MAGIC = 0xf518
+UF_ENTRY_END_MAGIC = 0x3581
+UF_VERSION = 2
+UF_VERSION_CRYPT = 0x8002
+
+UNDO_HASH_SIZE = 32
+NMARKS = 26
+
+# Optional field types
+UF_LAST_SAVE_NR = 1
+UHP_SAVE_NR = 1
+
+# ANSI color codes
+COLORS = {
+    'RED': "\033[31m",
+    'BRED': "\033[31;1m",     # Bright red
+    'GREEN': "\033[32m",
+    'BGREEN': "\033[32;1m",   # Bright green
+    'BROWN': "\033[33m",
+    'YELLOW': "\033[33;1m",  # Bright yellow
+    'BLUE': "\033[34m",
+    'CYAN': "\033[36m",
+    'MAGENTA': "\033[35m",
+    'GRAY': "\033[90m",
+    'BOLD': "\033[1m",
+    'DIM': "\033[2m",
+    'RST': "\033[0m",         # Reset
+
+    'GOOD': "\033[32;1m",
+    'WARN': "\033[33;1m",
+    'ERR': "\033[33;1m",
+}
+
+def disable_colors():
+    """Disable all colors"""
+    for key in COLORS:
+        COLORS[key] = ''
+
+
+@dataclass
+class UndoEntry:
+    """Represents a single undo entry (u_entry_T)"""
+    ue_top: int
+    ue_bot: int
+    ue_lcount: int
+    ue_size: int
+    lines: List[bytes]
+
+@dataclass
+class UndoHeader:
+    """Represents an undo header (u_header_T)"""
+    uh_seq: int
+    uh_next_seq: int
+    uh_prev_seq: int
+    uh_alt_next_seq: int
+    uh_alt_prev_seq: int
+    uh_time: int
+    uh_save_nr: int
+    entries: List[UndoEntry]
+
+class VimUndoParser:
+    def __init__(self, filepath: str, verbose: bool = False):
+        self.filepath = Path(filepath)
+        self.headers: List[UndoHeader] = []
+        self.encrypted = False
+        self.verbose = verbose
+        
+    def log(self, msg: str):
+        """Print verbose logging"""
+        if self.verbose:
+            print(f"[DEBUG] {msg}")
+    
+    def read_bytes(self, fp: BinaryIO, n: int) -> bytes:
+        """Read exactly n bytes"""
+        data = fp.read(n)
+        if len(data) != n:
+            raise EOFError(f"Expected {n} bytes, got {len(data)} at position {fp.tell() - len(data)}")
+        return data
+    
+    def read_u8(self, fp: BinaryIO) -> int:
+        """Read unsigned 8-bit int"""
+        return struct.unpack('>B', self.read_bytes(fp, 1))[0]
+    
+    def read_u16(self, fp: BinaryIO) -> int:
+        """Read unsigned 16-bit int (big-endian)"""
+        return struct.unpack('>H', self.read_bytes(fp, 2))[0]
+    
+    def read_u32(self, fp: BinaryIO) -> int:
+        """Read unsigned 32-bit int (big-endian)"""
+        return struct.unpack('>I', self.read_bytes(fp, 4))[0]
+    
+    def read_i32(self, fp: BinaryIO) -> int:
+        """Read signed 32-bit int (big-endian)"""
+        return struct.unpack('>i', self.read_bytes(fp, 4))[0]
+    
+    def read_u64(self, fp: BinaryIO) -> int:
+        """Read unsigned 64-bit int (big-endian)"""
+        return struct.unpack('>Q', self.read_bytes(fp, 8))[0]
+    
+    def read_optional_fields(self, fp: BinaryIO, context: str) -> dict:
+        """Read optional fields section
+        
+        Format: [length_byte] [type_byte] [data_bytes...]
+        where length_byte = size of data_bytes ONLY (not including type!)
+        """
+        fields = {}
+        self.log(f"Reading optional fields for {context} at position {fp.tell()}")
+        
+        while True:
+            pos = fp.tell()
+            field_len = self.read_u8(fp)
+            self.log(f"  Position {pos}: Field length: {field_len}")
+            
+            if field_len == 0:
+                self.log(f"  End of optional fields at position {fp.tell()}")
+                break
+            
+            field_type = self.read_u8(fp)
+            self.log(f"    Field type: {field_type} at position {fp.tell() - 1}")
+            
+            # field_len is the size of the DATA only, NOT including the type byte!
+            data_bytes = field_len
+            self.log(f"    Data bytes to read: {data_bytes}")
+            
+            if field_type == UF_LAST_SAVE_NR or field_type == UHP_SAVE_NR:
+                if data_bytes == 4:
+                    value = self.read_u32(fp)
+                    fields['save_nr'] = value
+                    self.log(f"      save_nr = {value}")
+                else:
+                    # Wrong size, skip
+                    self.log(f"      ERROR: save_nr should be 4 bytes, got {data_bytes}")
+                    print(f"      {COLORS['ERR']}ERROR: save_nr should be 4 bytes, got {data_bytes}{COLORS['RST']}")
+                    if data_bytes > 0:
+                        skipped = self.read_bytes(fp, data_bytes)
+                        self.log(f"      {COLORS['DIM']}Skipped: {skipped.hex()}{COLORS['RST']}")
+            else:
+                # Unknown field, skip
+                self.log(f"      Unknown field type {field_type}, skipping {data_bytes} bytes")
+                if data_bytes > 0:
+                    skipped = self.read_bytes(fp, data_bytes)
+                    if self.verbose:
+                        self.log(f"      Skipped: {skipped.hex()}")
+        
+        return fields
+    
+    def parse(self) -> bool:
+        """Parse the undo file"""
+        try:
+            with open(self.filepath, 'rb') as fp:
+                file_size = self.filepath.stat().st_size
+                self.log(f"File size: {file_size} bytes")
+                
+                # Read and verify magic
+                magic = self.read_bytes(fp, UF_START_MAGIC_LEN)
+                if magic != UF_START_MAGIC:
+                    print(f"{COLORS['ERR']}Error: Not a valid Vim undo file (bad magic){COLORS['RST']}")
+                    return False
+                
+                self.log(f"Magic verified, position: {fp.tell()}")
+                
+                # Read version
+                version = self.read_u16(fp)
+                self.log(f"Version: {version}, position: {fp.tell()}")
+                
+                if version == UF_VERSION_CRYPT:
+                    print(f"{COLORS['WARN']}Error: Encrypted undo files are not yet supported{COLORS['RST']}")
+                    self.encrypted = True
+                    return False
+                elif version != UF_VERSION:
+                    print(f"{COLORS['ERR']}Error: Unsupported undo file version: {version}{COLORS['RST']}")
+                    return False
+
+                
+                # Read hash
+                file_hash = self.read_bytes(fp, UNDO_HASH_SIZE)
+                self.log(f"Hash read, position: {fp.tell()}")
+                
+                # Read buffer metadata
+                line_count = self.read_u32(fp)
+                u_line_ptr_len = self.read_u32(fp)
+                self.log(f"Line count: {line_count}, u_line_ptr_len: {u_line_ptr_len}")
+                
+                # Read u_line_ptr data if present
+                if u_line_ptr_len > 0:
+                    u_line_ptr_data = self.read_bytes(fp, u_line_ptr_len)
+                    self.log(f"Read {u_line_ptr_len} bytes of u_line_ptr data")
+                
+                u_line_lnum = self.read_u32(fp)
+                u_line_colnr = self.read_u32(fp)
+                self.log(f"u_line_lnum: {u_line_lnum}, u_line_colnr: {u_line_colnr}")
+                
+                # Read undo tree pointers (sequences)
+                b_u_oldhead_seq = self.read_u32(fp)
+                b_u_newhead_seq = self.read_u32(fp)
+                b_u_curhead_seq = self.read_u32(fp)
+                self.log(f"Tree pointers - old:{b_u_oldhead_seq} new:{b_u_newhead_seq} cur:{b_u_curhead_seq}")
+                
+                b_u_numhead = self.read_u32(fp)
+                b_u_seq_last = self.read_u32(fp)
+                b_u_seq_cur = self.read_u32(fp)
+                b_u_time_cur = self.read_u64(fp)
+                self.log(f"numhead: {b_u_numhead}, seq_last: {b_u_seq_last}, position: {fp.tell()}")
+                
+                # Read optional header fields
+                header_fields = self.read_optional_fields(fp, "file header")
+                self.log(f"After file header optional fields, position: {fp.tell()}")
+                
+                print(f"Undo file info:")
+                print(f"  Version: {version}")
+                print(f"  Line count: {line_count}")
+                print(f"  Number of headers: {b_u_numhead}")
+                print(f"  Sequence last: {b_u_seq_last}")
+                print()
+                
+                # Read all undo headers
+                header_count = 0
+                while fp.tell() < file_size:
+                    pos_before = fp.tell()
+                    self.log(f"\n--- Attempting to read header at position {pos_before} ---")
+                    
+                    try:
+                        magic = self.read_u16(fp)
+                        self.log(f"Read magic: {magic:#x}")
+                        
+                        if magic == UF_HEADER_END_MAGIC:
+                            self.log("Found header end magic")
+                            break
+                        if magic != UF_HEADER_MAGIC:
+                            self.log(f"Warning: Expected header magic {UF_HEADER_MAGIC:#x}, got {magic:#x}")
+                            print(f"{COLORS['WARN']}Warning: Expected header magic at position {pos_before}, got {magic:#x}{COLORS['RST']}")
+                            break
+                        
+                        header = self._parse_header(fp)
+                        if header:
+                            self.headers.append(header)
+                            header_count += 1
+                            self.log(f"Successfully parsed header #{header_count}, seq={header.uh_seq}")
+                    except EOFError as e:
+                        self.log(f"EOF while reading header: {e}")
+                        break
+                
+                print(f"{COLORS['GOOD']}Successfully parsed {len(self.headers)} undo headers{COLORS['RST']}")
+
+                return True
+                
+        except Exception as e:
+            print(f"{COLORS['ERR']}Error parsing undo file: {e}{COLORS['RST']}")
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+            return False
+    
+    def _parse_header(self, fp: BinaryIO) -> Optional[UndoHeader]:
+        """Parse a single undo header"""
+        pos_start = fp.tell() - 2  # We already read the magic
+        self.log(f"Parsing header starting at {pos_start}")
+        
+        try:
+            uh_next_seq = self.read_u32(fp)
+            uh_prev_seq = self.read_u32(fp)
+            uh_alt_next_seq = self.read_u32(fp)
+            uh_alt_prev_seq = self.read_u32(fp)
+            uh_seq = self.read_u32(fp)
+            
+            self.log(f"  Sequence: {uh_seq}")
+            self.log(f"  Links: next={uh_next_seq} prev={uh_prev_seq} alt_next={uh_alt_next_seq} alt_prev={uh_alt_prev_seq}")
+            
+            if uh_seq <= 0:
+                print(f"{COLORS['WARN']}Warning: Invalid sequence number {uh_seq}{COLORS['RST']}")
+                return None
+            
+            # Read cursor position (pos_T = 3 * 4 bytes = 12 bytes)
+            uh_cursor_lnum = self.read_u32(fp)
+            uh_cursor_col = self.read_u32(fp)
+            uh_cursor_coladd = self.read_u32(fp)
+            self.log(f"  Cursor: lnum={uh_cursor_lnum} col={uh_cursor_col} coladd={uh_cursor_coladd}")
+            
+            uh_cursor_vcol = self.read_i32(fp)
+            uh_flags = self.read_u16(fp)
+            self.log(f"  vcol={uh_cursor_vcol} flags={uh_flags:#x}")
+            
+            # Skip named marks (NMARKS * pos_T = 26 * 12 bytes = 312 bytes)
+            self.read_bytes(fp, NMARKS * 12)
+            
+            # Skip visual info (visualinfo_T)
+            # 2 * pos_T + 2 * int = 24 + 8 = 32 bytes
+            # Actually it's: vi_start(12) + vi_end(12) + vi_mode(4) + vi_curswant(4) = 32
+            self.read_bytes(fp, 32)
+            
+            uh_time = self.read_u64(fp)
+            timestamp = datetime.fromtimestamp(uh_time).strftime('%Y-%m-%d %H:%M:%S')
+            self.log(f"  Time: {timestamp}")
+            
+            # Read optional fields
+            fields = self.read_optional_fields(fp, f"header seq={uh_seq}")
+            uh_save_nr = fields.get('save_nr', 0)
+            
+            # Parse entries
+            entries = []
+            entry_count = 0
+            while True:
+                entry_magic = self.read_u16(fp)
+                self.log(f"  Entry magic: {entry_magic:#x}")
+                
+                if entry_magic == UF_ENTRY_END_MAGIC:
+                    self.log(f"  End of entries for header")
+                    break
+                if entry_magic != UF_ENTRY_MAGIC:
+                    print(f"{COLORS['WARN']}Warning: Expected entry magic {UF_ENTRY_MAGIC:#x}, got {entry_magic:#x}{COLORS['RST']}")
+                    # Try to recover by backing up
+                    fp.seek(fp.tell() - 2)
+                    break
+                
+                entry = self._parse_entry(fp)
+                if entry:
+                    entries.append(entry)
+                    entry_count += 1
+                    self.log(f"    Parsed entry #{entry_count}: {entry.ue_size} lines")
+            
+            self.log(f"  Total entries for header: {entry_count}")
+            
+            return UndoHeader(
+                uh_seq=uh_seq,
+                uh_next_seq=uh_next_seq,
+                uh_prev_seq=uh_prev_seq,
+                uh_alt_next_seq=uh_alt_next_seq,
+                uh_alt_prev_seq=uh_alt_prev_seq,
+                uh_time=uh_time,
+                uh_save_nr=uh_save_nr,
+                entries=entries
+            )
+        except Exception as e:
+            self.log(f"Error parsing header: {e}")
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+            return None
+    
+    def _parse_entry(self, fp: BinaryIO) -> Optional[UndoEntry]:
+        """Parse a single undo entry"""
+        try:
+            ue_top = self.read_u32(fp)
+            ue_bot = self.read_u32(fp)
+            ue_lcount = self.read_u32(fp)
+            ue_size = self.read_u32(fp)
+            
+            self.log(f"      Entry: top={ue_top} bot={ue_bot} lcount={ue_lcount} size={ue_size}")
+            
+            lines = []
+            for i in range(ue_size):
+                line_len = self.read_u32(fp)
+                self.log(f"        Line {i}: length={line_len}")
+                if line_len > 0:
+                    line_data = self.read_bytes(fp, line_len)
+                    lines.append(line_data)
+                    preview = line_data[:80].decode('utf-8', errors='replace')
+                    self.log(f"        Line {i} data: '{preview}'")
+                else:
+                    lines.append(b'')
+                    self.log(f"        Line {i}: empty")
+            
+            return UndoEntry(
+                ue_top=ue_top,
+                ue_bot=ue_bot,
+                ue_lcount=ue_lcount,
+                ue_size=ue_size,
+                lines=lines
+            )
+        except Exception as e:
+            self.log(f"Error parsing entry: {e}")
+            return None
+    
+    def extract_all_text_states(self) -> List[Tuple[int, int, List[bytes]]]:
+        """
+        Extract all unique text states from the undo tree.
+        Returns list of (sequence_number, timestamp, lines) tuples.
+        """
+        states = []
+        
+        for header in self.headers:
+            for entry in header.entries:
+                if entry.lines:
+                    states.append((header.uh_seq, header.uh_time, entry.lines))
+        
+        return states
+    
+    def reconstruct_all_content_states(self) -> List[Tuple[int, List[bytes]]]:
+        """
+        Extract all states that contain actual content (non-empty lines).
+        Returns list of (sequence_number, lines) tuples, sorted by sequence.
+        """
+        states = []
+        
+        for header in sorted(self.headers, key=lambda h: h.uh_seq):
+            for entry in header.entries:
+                if entry.lines and any(line for line in entry.lines):
+                    content_lines = [line for line in entry.lines if line]
+                    if content_lines:
+                        states.append((header.uh_seq, content_lines))
+        
+        return states
+    
+    def reconstruct_all_versions_by_line(self) -> dict:
+        """
+        Forensic mode: Extract ALL versions of each line, sorted by line number then time.
+        Returns: {line_num: [(timestamp, seq, line_content), ...]}
+        """
+        line_versions = {}  # line_num -> list of (timestamp, seq, content)
+        
+        for header in self.headers:
+            for entry in header.entries:
+                if entry.ue_size == 1 and entry.lines and entry.lines[0]:
+                    line_num = entry.ue_top + 1
+                    if line_num not in line_versions:
+                        line_versions[line_num] = []
+                    line_versions[line_num].append((
+                        header.uh_time,
+                        header.uh_seq,
+                        entry.lines[0]
+                    ))
+                elif entry.ue_size > 1 and entry.lines:
+                    for i, line_content in enumerate(entry.lines):
+                        if line_content:
+                            line_num = entry.ue_top + i + 1
+                            if line_num not in line_versions:
+                                line_versions[line_num] = []
+                            line_versions[line_num].append((
+                                header.uh_time,
+                                header.uh_seq,
+                                line_content
+                            ))
+        
+        # Sort each line's versions by timestamp
+        for line_num in line_versions:
+            line_versions[line_num].sort(key=lambda x: x[0])  # Sort by timestamp
+        
+        return line_versions
+
+    def reconstruct_using_line_positions(self, skip_last: int = 0, skip_deletions: bool = False) -> Tuple[Optional[List[bytes]], dict]:
+        """
+        Reconstruct file using line position information from undo entries.
+        Returns (lines, metadata) where metadata shows which sequence each line came from.
+        
+        Args:
+            skip_last: Skip the last N headers when reconstructing
+            skip_deletions: Skip trailing deletion-only operations
+        """
+        # Sort headers and apply skip options
+        sorted_headers = sorted(self.headers, key=lambda h: h.uh_seq)
+        
+        if skip_last > 0:
+            sorted_headers = sorted_headers[:-skip_last] if len(sorted_headers) > skip_last else []
+        
+        if skip_deletions:
+            # Remove headers from the end that only contain deletions (no text)
+            while sorted_headers:
+                last_header = sorted_headers[-1]
+                has_content = any(
+                    entry.lines and any(line for line in entry.lines)
+                    for entry in last_header.entries
+                )
+                if has_content:
+                    break
+                sorted_headers.pop()
+        
+        if not sorted_headers:
+            return None, {}
+        
+        # Map: line_number -> (line_content, sequence_number)
+        line_map = {}
+        
+        for header in sorted_headers:
+            for entry in header.entries:
+                if entry.ue_size == 1 and entry.lines and entry.lines[0]:
+                    # Single line entry - ue_top tells us which line number
+                    line_num = entry.ue_top + 1  # +1 because top is 0-indexed
+                    line_content = entry.lines[0]
+                    
+                    # Keep this line (later sequences overwrite earlier ones)
+                    line_map[line_num] = (line_content, header.uh_seq)
+                elif entry.ue_size > 1 and entry.lines:
+                    # Multi-line entry - map each line starting from ue_top
+                    for i, line_content in enumerate(entry.lines):
+                        if line_content:
+                            line_num = entry.ue_top + i + 1
+                            line_map[line_num] = (line_content, header.uh_seq)
+        
+        if not line_map:
+            return None, {}
+        
+        # Build the file from line 1 to max
+        max_line = max(line_map.keys())
+        result = []
+        metadata = {}
+        
+        for line_num in range(1, max_line + 1):
+            if line_num in line_map:
+                content, seq = line_map[line_num]
+                result.append(content)
+                metadata[line_num] = seq
+            else:
+                # This line was never edited, so not in undo
+                result.append(b'# [LINE NOT IN UNDO HISTORY]')
+                metadata[line_num] = -1
+        
+        return result, metadata
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="""Vim Undo File Parser - Recover files from .un~ files.
+
+(Note: You might have 'undodir' set in your .vimrc, in which case vim stores
+       files there, using full paths with slashes replaced by % characters.
+       (In vim, see ":set undodir?" to see if vim is using that alternate
+       location)
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s file.py.un~
+  %(prog)s file.py.un~ -o recovered.py
+  %(prog)s file.py.un~ -o recovered.py -v
+  %(prog)s file.py.un~ --show-all
+  %(prog)s file.py.un~ --explain
+        """
+    )
+    
+    parser.add_argument('undo_file', nargs='?', help='Path to Vim undo file (.un~)')
+    parser.add_argument('-o', '--output', metavar='FILE',
+                        help='Save recovered text to FILE')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose debug output')
+    parser.add_argument('-a', '--show-all', action='store_true',
+                        help='Show all text states, not just the latest (! DISPLAY MODE ONLY !)')
+    parser.add_argument('--hex-dump', type=int, nargs=2, metavar=('OFFSET', 'LENGTH'),
+                        help='Dump hex at OFFSET for LENGTH bytes (debug mode)')
+    parser.add_argument('-X', '--skip-last', type=int, metavar='N', default=0,
+                        help='Skip the last N undo operations (useful if last changes were deletions)')
+    parser.add_argument('-D', '--skip-deletions', action='store_true',
+                        help='Skip trailing deletion-only operations at the end')
+    parser.add_argument('--forensic', '--all-versions', action='store_true',
+                        help='Forensic mode: Output ALL versions of each line, sorted by line number then time')
+    parser.add_argument('--explain', action='store_true',
+                        help='Show educational information about Vim undo file structure and exit')
+    
+    args = parser.parse_args()
+
+    if not args.undo_file and not args.explain:
+        print("Please provide an undo_file path. See -h for help.")
+        sys.exit(1)
+    
+    # Explain mode
+    if args.explain:
+        print("""
+================================================================================
+                     VIM UNDO FILE FORMAT EXPLAINED
+================================================================================
+
+Based on Vim's undo.c source code, persistent undo files store the complete
+history of changes to a file, allowing unlimited undo/redo even after closing
+and reopening Vim.
+
+STRUCTURE OVERVIEW
+==================
+
+The undo file consists of:
+  1. File header (magic, version, hash, metadata)
+  2. Series of undo HEADERS (one per user operation)
+  3. Each header contains one or more ENTRIES (line data)
+
+MAGIC NUMBERS (from undo.c)
+============================
+  UF_START_MAGIC      = "Vim\\x9fUnDo\\xe5"  # File starts with this 9-byte sequence
+  UF_VERSION          = 2                    # Current undo file format version
+  UF_VERSION_CRYPT    = 0x8002               # Encrypted undo file marker
+  
+  UF_HEADER_MAGIC     = 0x5fd0               # Marks start of an undo header
+  UF_HEADER_END_MAGIC = 0xe7aa               # Marks end of all headers
+  
+  UF_ENTRY_MAGIC      = 0xf518               # Marks start of an entry (line data)
+  UF_ENTRY_END_MAGIC  = 0x3581               # Marks end of entries for a header
+
+HEADERS (u_header_T)
+====================
+Each header represents ONE user operation (typing, delete, paste, substitution).
+
+Fields:
+  - uh_seq:          Sequence number (increments with each operation)
+  - uh_next/prev:    Links to form linear undo history
+  - uh_alt_next/prev: Links to form branching undo tree (for alternate histories)
+  - uh_time:         Unix timestamp when operation occurred
+  - uh_save_nr:      Counter incremented each time file is saved
+  - uh_cursor:       Cursor position after this operation
+  - uh_flags:        Flags (UH_CHANGED if buffer was modified, UH_EMPTYBUF if empty)
+  - uh_namedm[26]:   Named marks ('a'-'z') positions
+  - uh_visual:       Visual selection info
+
+ENTRIES (u_entry_T)
+===================
+Each entry stores the OLD text that was replaced by an operation.
+One header can have multiple entries (e.g., paste operation affecting many lines).
+
+Fields:
+  - ue_top:    Starting line number affected (0-indexed)
+  - ue_bot:    Ending line number (0 = deleted to EOF)
+  - ue_lcount: Total line count in file after operation
+  - ue_size:   Number of lines stored in this entry
+  - ue_array:  Array of actual line data (the OLD lines that were removed/replaced)
+
+KEY INSIGHT: What Vim Stores
+=============================
+Vim's undo stores the OLD state, NOT the new state!
+
+Example: Type "hello" on line 5
+  - Current file: line 5 contains "hello"
+  - Undo entry:   line 5 contained "" (empty/previous content)
+  - Press 'u':    Vim restores the empty line from undo
+
+Example: Delete lines 10-15
+  - Current file: lines 10-15 are gone
+  - Undo entry:   contains the 6 deleted lines
+  - Press 'u':    Vim restores those 6 lines
+
+Example: Global substitution :%s/foo/bar/g on 50 lines
+  - Current file: all instances of "foo" changed to "bar"
+  - Undo entry:   contains all 50 lines with "foo" in them
+  - Press 'u':    Vim restores all 50 lines with "foo"
+
+OPTIONAL FIELDS
+===============
+Both file header and undo headers can have optional fields:
+
+  Type 1 (UF_LAST_SAVE_NR / UHP_SAVE_NR):
+    - 4-byte integer: save counter
+    - Tracks how many times file was written to disk
+    - Used to sync undo history with file saves
+
+Format: [length_byte] [type_byte] [data_bytes...]
+  - length_byte: size of data ONLY (not including type byte)
+  - type_byte:   identifies what kind of data follows
+  - data_bytes:  the actual data (length specified by length_byte)
+  - End marker:  length_byte = 0
+
+RECONSTRUCTION NOTES
+====================
+This tool reconstructs files by:
+  1. Parsing all headers and entries
+  2. Using ue_top field to determine which line each entry came from
+  3. Building a line-by-line map (later sequences overwrite earlier ones)
+  4. Outputting the reconstructed file with placeholders for missing lines
+
+Lines marked "# [LINE NOT IN UNDO HISTORY]" were never edited, so they don't
+appear in the undo file. You'll need to recover these from other sources.
+
+LIMITATIONS
+===========
+- Cannot recover lines that were never edited
+- Encrypted undo files not yet supported
+- If file hash doesn't match, Vim silently ignores the undo file
+
+For more details, see Vim's source: src/undo.c
+================================================================================
+""")
+        sys.exit(0)
+    
+    # Hex dump mode
+    if args.hex_dump:
+        offset, length = args.hex_dump
+        with open(args.undo_file, 'rb') as f:
+            f.seek(offset)
+            data = f.read(length)
+            print(f"Hex dump at offset {offset} ({length} bytes):")
+            for i in range(0, len(data), 16):
+                hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                print(f"{offset+i:08x}  {hex_str:<48}  {ascii_str}")
+        sys.exit(0)
+    
+    undo_parser = VimUndoParser(args.undo_file, verbose=args.verbose)
+    
+    if not undo_parser.parse():
+        print("Failed to parse undo file")
+        sys.exit(1)
+    
+    print("\n" + "="*60)
+    print("EXTRACTING TEXT STATES")
+    print("="*60 + "\n")
+    
+    states = undo_parser.extract_all_text_states()
+    
+    if not states:
+        print("No text states found in undo file")
+        sys.exit(1)
+    
+    print(f"Found {len(states)} text state(s)\n")
+    
+    if args.forensic:
+        print("FORENSIC MODE: Showing all versions of each line")
+        print("="*60)
+        
+        all_versions = undo_parser.reconstruct_all_versions_by_line()
+        
+        if not all_versions:
+            print("{COLORS['WARN']}No line versions found{COLORS['RST']}")
+            sys.exit(1)
+        
+        # Sort by line number
+        for line_num in sorted(all_versions.keys()):
+            versions = all_versions[line_num]
+            print(f"\n{'='*60}")
+            print(f"LINE {line_num} ({len(versions)} version(s))")
+            print(f"{'='*60}")
+            
+            for timestamp, seq, content in versions:
+                ts = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                print(f"[Seq {seq:3d} | {ts}]")
+                try:
+                    print(f"  {content.decode('utf-8', errors='replace')}")
+                except Exception as e:
+                    print(f"  {COLORS['ERR']}Error decoding: {e}{COLORS['RST']}")
+                print()
+        
+        if args.output:
+            print(f"\nForensic mode output saved to: {args.output}")
+            try:
+                with open(args.output, 'wb') as f:
+                    for line_num in sorted(all_versions.keys()):
+                        versions = all_versions[line_num]
+                        f.write(f"\n{'='*60}\n".encode())
+                        f.write(f"LINE {line_num} ({len(versions)} version(s))\n".encode())
+                        f.write(f"{'='*60}\n".encode())
+                        
+                        for timestamp, seq, content in versions:
+                            ts = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                            f.write(f"[Seq {seq:3d} | {ts}]\n".encode())
+                            f.write(b"  ")
+                            f.write(content)
+                            f.write(b'\n\n')
+                print(f"✓ Saved forensic output to: {args.output}")
+            except Exception as e:
+                print(f"✗ Error saving: {e}")
+        
+        sys.exit(0)
+    
+    if args.show_all:
+        print("WARNING: -a is display-only. WE ARE NOT RE-CONSTRUCTING YOUR FILE.", file=sys.stderr)
+        # Show all states with content
+        content_states = undo_parser.reconstruct_all_content_states()
+        
+        if not content_states:
+            print("No content states found")
+            sys.exit(1)
+        
+        print(f"Found {len(content_states)} content state(s)\n")
+        print("All content states found:")
+        print("="*60)
+        
+        for i, (seq, lines) in enumerate(content_states):
+            print(f"\nState #{i+1} (sequence {seq}):")
+            print("-" * 60)
+            try:
+                for line in lines:
+                    print(line.decode('utf-8', errors='replace'))
+            except Exception as e:
+                print(f"Error decoding: {e}")
+        print("WARNING: -a is display-only. WE DID NOT RE-CONSTRUCT YOUR FILE.", file=sys.stderr)
+    else:
+        # Try to reconstruct using line positions
+        latest, metadata = undo_parser.reconstruct_using_line_positions(
+            skip_last=args.skip_last,
+            skip_deletions=args.skip_deletions
+        )
+        
+        if latest:
+            print(f"{COLORS['CYAN']}Reconstructed file using line position information:{COLORS['RST']}")
+            if args.skip_last:
+                print(f"  {COLORS['DIM']}(skipped last {args.skip_last} operations){COLORS['RST']}")
+            if args.skip_deletions:
+                print(f"  (skipped trailing deletions)")
+            if args.verbose:
+                print("  (showing sequence number for each line)")
+            print("-" * 60)
+            try:
+                # In main(), after calling reconstruct_using_line_positions()
+                for i, line in enumerate(latest, 1):
+                    if args.verbose and i in metadata:
+                        seq = metadata[i]
+                        if seq >= 0:
+                            seq_str = f"{COLORS['CYAN']}[seq {seq:3d}]{COLORS['RST']}"
+                        else:
+                            seq_str = f"{COLORS['YELLOW']}[no undo]{COLORS['RST']}"
+                        print(f"{seq_str} {line.decode('utf-8', errors='replace')}")
+                    else:
+                        print(line.decode('utf-8', errors='replace'))
+            except Exception as e:
+                print(f"Error decoding text: {e}")
+            print("-" * 60)
+            
+            if args.output:
+                try:
+                    with open(args.output, 'wb') as f:
+                        for line in latest:
+                            f.write(line)
+                            f.write(b'\n')
+                    print(f"\n{COLORS['GOOD']}✓ Saved to: {args.output}{COLORS['RST']}")
+                except Exception as e:
+                    print(f"\n{COLORS['ERR']}✗ Error saving to file: {e}{COLORS['RST']}")
+        else:
+            print("Could not reconstruct any content from undo file")
+            print("\nTip: Try using -a to see all available states")
+            print("     Or use -X N to skip the last N operations")
+            print("     Or use -D to skip trailing deletions")
+
+
+if __name__ == "__main__":
+    main()
