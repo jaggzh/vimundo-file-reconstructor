@@ -1,6 +1,6 @@
 # vimundo-file-reconstructor
 
-Vim Undo File Parser - Recover files from .un~ files.
+Vim Undo File Parser - Recover files from vimundo files.
 
 ```
 usage: vimundo-file-reconstructor [-h] [-o FILE] [-v] [-a]
