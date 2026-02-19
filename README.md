@@ -10,7 +10,7 @@ usage: vimundo-file-reconstructor [-h] [-o FILE] [-v] [-a]
 
 <div align="center">
   <img src="ss/claude-celebration.png" alt="Claude.ai 'excited'"><br>
-  <em>Claude "excited" after it saw my successful run...</em><br>
+  <em>Claude "excited" after our hours and hours of working out solutions.. and Claude seeing my recovered file contents.. from our first successful run.</em><br>
 </div>
 
 ## Why!?
